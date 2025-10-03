@@ -1,92 +1,220 @@
-# app.py
+from typing import List, Dict, Optional
 import os
-import traceback
-from typing import List, Dict
+import re
+import time
+import random
+from urllib.parse import urlparse
 
-import pandas as pd
-import streamlit as st
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
-# NOTE: do NOT import InstagramScraperSelenium at the top.
-from core.cleaners import clean_dataframe_basic
-from core.exporters import df_to_csv_bytes, df_to_xlsx_bytes
 
-st.set_page_config(page_title="Instagram Profile Scraper (Selenium)", layout="wide")
-st.title("Instagram Profile Scraper (Selenium + Headless Chromium)")
+# ----------------------------
+# Helpers
+# ----------------------------
 
-with st.expander("How it works", expanded=False):
-    st.markdown(
-        """
-- Enter an Instagram **username** (e.g., `@username`) or **profile URL** (e.g., `https://instagram.com/username/`).
-- The app uses **Selenium + headless Chromium** to scroll the profile grid and collect `/p/` (posts) and `/reel/` (reels) URLs.
-- Results can be downloaded as **CSV** or **Excel**.
-- Set environment variables **`INSTAGRAM_USERNAME`** and **`INSTAGRAM_PASSWORD`** on the host, then **Restart** the service.
-        """
+def _normalize_instagram_input(raw: str) -> Optional[str]:
+    """Accepts @user / user / https://instagram.com/user and returns 'user'."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("@"):
+        text = text[1:]
+    if text.startswith("http://") or text.startswith("https://"):
+        try:
+            p = urlparse(text)
+            seg = (p.path or "").strip("/").split("/")[0]
+            if seg:
+                text = seg
+        except Exception:
+            pass
+    return text if re.match(r"^[A-Za-z0-9._]{1,100}$", text) else None
+
+
+def _build_driver(headless: bool = True) -> webdriver.Chrome:
+    """Build a Chrome driver that works on Render (Chromium from apt)."""
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
     )
 
-raw_input: str = st.text_input(
-    "Instagram username or profile URL",
-    placeholder="@user or https://instagram.com/user"
-)
-run = st.button("Scrape Post URLs")
+    # IMPORTANT: explicit paths for Render’s apt-installed Chromium & Chromedriver
+    chrome_options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    service = Service(os.getenv("CHROMEDRIVER", "/usr/bin/chromedriver"))
 
-env_user_present = bool(os.getenv("INSTAGRAM_USERNAME"))
-env_pass_present = bool(os.getenv("INSTAGRAM_PASSWORD"))
-st.caption(f"Env check → INSTAGRAM_USERNAME: **{env_user_present}**, INSTAGRAM_PASSWORD: **{env_pass_present}**")
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return driver
 
-if run:
-    if not raw_input or not raw_input.strip():
-        st.error("Please enter a username or profile URL.")
-        st.stop()
 
-    with st.spinner("Scraping… this can take a moment on a cold start."):
-        print(f"[APP] Start scrape for: {raw_input}", flush=True)
-        print(f"[APP] ENV present? USER={env_user_present} PASS={env_pass_present}", flush=True)
-
+def _dismiss_cookie_banner(driver: webdriver.Chrome):
+    """Try to accept/close cookie banners that block the grid."""
+    candidates = [
+        '//button//*[contains(text(),"Allow all cookies")]/ancestor::button',
+        '//button//*[contains(text(),"Allow All")]/ancestor::button',
+        '//button//*[contains(text(),"Only allow essential cookies")]/ancestor::button',
+        '//button[contains(text(),"Allow all cookies")]',
+        '//button[contains(text(),"Allow All")]',
+        '//button[contains(text(),"Only allow essential cookies")]',
+        '//div[@role="dialog"]//button[contains(text(),"Accept")]',
+    ]
+    for xp in candidates:
         try:
-            # Lazy import here to avoid circular import issues
-            from scrapers.instagram_selenium import InstagramScraperSelenium  # noqa: E402
+            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            btn.click()
+            time.sleep(1.2)
+            print("[SCRAPER] Cookie banner dismissed", flush=True)
+            break
+        except Exception:
+            pass
 
-            scraper = InstagramScraperSelenium()
-            rows: List[Dict] = scraper.scrape_profile(raw_input)
-            print(f"[APP] Scrape returned {len(rows) if rows else 0} rows", flush=True)
 
-            if not rows:
-                st.warning("No data returned. Try a public profile first (e.g., https://www.instagram.com/instagram/).")
-                st.stop()
+def _login(driver: webdriver.Chrome, username: str, password: str) -> None:
+    """Log in to Instagram (for private profiles or when a login wall appears)."""
+    print("[SCRAPER] Logging in…", flush=True)
+    driver.get("https://www.instagram.com/accounts/login/")
+    time.sleep(random.uniform(3.5, 5.5))
 
-            df = pd.DataFrame(rows)
-            df = clean_dataframe_basic(df)
+    wait = WebDriverWait(driver, 20)
+    u = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+    p = wait.until(EC.presence_of_element_located((By.NAME, "password")))
+    u.send_keys(username)
+    p.send_keys(password)
+    submit = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+    submit.click()
+    time.sleep(random.uniform(5, 7))
 
-            st.subheader("Preview")
-            st.dataframe(df.head(200), use_container_width=True)
+    # Dismiss potential popups
+    for _ in range(3):
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"Not Now") or contains(text(),"Not now")]'))
+            )
+            btn.click()
+            time.sleep(1.5)
+        except TimeoutException:
+            break
+    print("[SCRAPER] Login step complete", flush=True)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "⬇️ Download CSV",
-                    data=df_to_csv_bytes(df),
-                    file_name="instagram_post_urls.csv",
-                    mime="text/csv"
-                )
-            with c2:
-                st.download_button(
-                    "⬇️ Download Excel",
-                    data=df_to_xlsx_bytes(df),
-                    file_name="instagram_post_urls.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
 
-            st.success(f"Done! Collected {len(df)} URLs.")
-        except Exception as e:
-            st.error(f"Error during scrape: {e}")
-            tb = traceback.format_exc()
-            print("[APP] Exception during scrape:\n" + tb, flush=True)
+def _collect_post_urls(driver: webdriver.Chrome, handle: str, max_idle_scrolls: int = 10) -> List[str]:
+    """Scroll the profile grid, collecting /p/ (posts) and /reel/ (reels)."""
+    profile_url = f"https://www.instagram.com/{handle}/"
+    print(f"[SCRAPER] Visiting: {profile_url}", flush=True)
+    driver.get(profile_url)
+    time.sleep(random.uniform(3, 5))
 
-st.markdown(
-    """
----
-**Tips**
-- If you see “No data returned”, confirm env vars are set and **Restart** the service.
-- Test with a known public profile first: `https://www.instagram.com/instagram/`.
-"""
-)
+    _dismiss_cookie_banner(driver)
+
+    # If a login wall appears, signal to caller
+    try:
+        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.NAME, "username")))
+        print("[SCRAPER] Login wall detected on profile page", flush=True)
+        return ["__LOGIN_REQUIRED__"]
+    except Exception:
+        pass
+
+    # Private / no-posts quick checks
+    if driver.find_elements(By.XPATH, '//*[contains(text(),"This account is private")]'):
+        print("[SCRAPER] Private account", flush=True)
+        return []
+    if driver.find_elements(By.XPATH, '//*[contains(text(),"No posts yet")]'):
+        print("[SCRAPER] No posts yet", flush=True)
+        return []
+
+    # Wait for some anchors to appear
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/p/"], a[href*="/reel/"]'))
+        )
+    except Exception:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+
+    post_urls = set()
+    prev_count = 0
+    idle = 0
+
+    def capture() -> int:
+        anchors = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/p/"], a[href*="/reel/"]')
+        for a in anchors:
+            href = a.get_attribute("href")
+            if href and ("/p/" in href or "/reel/" in href):
+                post_urls.add(href.split("?")[0])
+        return len(anchors)
+
+    n0 = capture()
+    print(f"[SCRAPER] Initial anchors found: {n0}", flush=True)
+
+    # Scroll loop
+    while True:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(random.uniform(1.8, 3.5))
+        _ = capture()
+        curr = len(post_urls)
+        print(f"[SCRAPER] Collected so far: {curr}", flush=True)
+
+        if curr == prev_count:
+            idle += 1
+        else:
+            idle = 0
+        prev_count = curr
+
+        if idle >= max_idle_scrolls:
+            break
+
+    print(f"[SCRAPER] Final posts: {len(post_urls)}", flush=True)
+    return sorted(post_urls)
+
+
+def _url_to_row(url: str) -> Dict:
+    kind = "post" if "/p/" in url else ("reel" if "/reel/" in url else "unknown")
+    m = re.search(r"/(p|reel)/([^/]+)/?", url)
+    shortcode = m.group(2) if m else None
+    return {"type": kind, "shortcode": shortcode, "post_url": url}
+
+
+# ----------------------------
+# Public class
+# ----------------------------
+
+class InstagramScraperSelenium:
+    def scrape_profile(self, handle_or_url: str) -> List[Dict]:
+        handle = _normalize_instagram_input(handle_or_url)
+        if not handle:
+            print("[SCRAPER] Invalid handle", flush=True)
+            return []
+
+        user = os.getenv("INSTAGRAM_USERNAME", "")
+        pwd = os.getenv("INSTAGRAM_PASSWORD", "")
+
+        driver = _build_driver(headless=True)
+        try:
+            # First attempt (public profiles often work without login)
+            urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
+
+            # If login required and creds available, login and retry once
+            if urls == ["__LOGIN_REQUIRED__"] and user and pwd:
+                _login(driver, user, pwd)
+                urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
+
+            if not urls or urls == ["__LOGIN_REQUIRED__"]:
+                print("[SCRAPER] No URLs collected", flush=True)
+                return []
+
+            return [_url_to_row(u) for u in urls]
+        finally:
+            driver.quit()
