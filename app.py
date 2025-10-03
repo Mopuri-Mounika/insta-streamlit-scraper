@@ -6,43 +6,66 @@ from typing import List, Dict
 import pandas as pd
 import streamlit as st
 
-# NOTE: do NOT import InstagramScraperSelenium at the top.
+# NOTE: do NOT import InstagramScraperSelenium at the top (lazy import below).
 from core.cleaners import clean_dataframe_basic
 from core.exporters import df_to_csv_bytes, df_to_xlsx_bytes
 
+# -----------------------------
+# Streamlit page configuration
+# -----------------------------
 st.set_page_config(page_title="Instagram Profile Scraper (Selenium)", layout="wide")
 st.title("Instagram Profile Scraper (Selenium + Headless Chromium)")
 
 with st.expander("How it works", expanded=False):
-    st.write("""
-    - Enter an Instagram **username** (e.g., `@example`) or **profile URL**.
-    - The app uses **Selenium + headless Chromium** to scroll the profile and collect `/p/` and `/reel/` URLs.
-    - Download results as **CSV/XLSX**.
-    - Set env vars `INSTAGRAM_USERNAME` and `INSTAGRAM_PASSWORD` for login if needed.
-    """)
+    st.markdown(
+        """
+- Enter an Instagram **username** (e.g., `@username`) or **profile URL** (e.g., `https://instagram.com/username/`).
+- The app uses **Selenium + headless Chromium** to scroll the profile grid and collect `/p/` (posts) and `/reel/` (reels) URLs.
+- Results can be downloaded as **CSV** or **Excel**.
+- Set environment variables **`INSTAGRAM_USERNAME`** and **`INSTAGRAM_PASSWORD`** on the host, then **Restart** the service.
+        """
+    )
 
-raw_input = st.text_input("Instagram username or profile URL", placeholder="@user or https://instagram.com/user")
-run = st.button("Scrape Post URLs")
+# -----------------------------
+# Inputs (give widgets unique keys)
+# -----------------------------
+raw_input: str = st.text_input(
+    "Instagram username or profile URL",
+    placeholder="@user or https://instagram.com/user",
+    key="profile_input"
+)
+run = st.button("Scrape Post URLs", key="run_button")
 
-# simple env presence hint (doesn't reveal secrets)
-st.caption(f"Env check → INSTAGRAM_USERNAME: **{bool(os.getenv('INSTAGRAM_USERNAME'))}**, "
-           f"INSTAGRAM_PASSWORD: **{bool(os.getenv('INSTAGRAM_PASSWORD'))}**")
+# Simple env presence hint (doesn't reveal secrets)
+env_user_present = bool(os.getenv("INSTAGRAM_USERNAME"))
+env_pass_present = bool(os.getenv("INSTAGRAM_PASSWORD"))
+st.caption(
+    f"Env check → INSTAGRAM_USERNAME: **{env_user_present}**, "
+    f"INSTAGRAM_PASSWORD: **{env_pass_present}**"
+)
 
+# -----------------------------
+# Run scraper
+# -----------------------------
 if run:
     if not raw_input or not raw_input.strip():
         st.error("Please enter a username or profile URL.")
         st.stop()
 
-    with st.spinner("Scraping…"):
+    with st.spinner("Scraping… this can take a moment on a cold start."):
+        print(f"[APP] Start scrape for: {raw_input}", flush=True)
+        print(f"[APP] ENV present? USER={env_user_present} PASS={env_pass_present}", flush=True)
+
         try:
-            # Lazy import here to avoid circular import issues
+            # Lazy import to avoid circular import issues
             from scrapers.instagram_selenium import InstagramScraperSelenium  # noqa: E402
 
             scraper = InstagramScraperSelenium()
             rows: List[Dict] = scraper.scrape_profile(raw_input)
+            print(f"[APP] Scrape returned {len(rows) if rows else 0} rows", flush=True)
         except Exception as e:
             st.error(f"Error during scrape: {e}")
-            print("[APP] Exception:", e, flush=True)
+            print("[APP] Exception during scrape:", e, flush=True)
             print(traceback.format_exc(), flush=True)
             st.stop()
 
@@ -50,6 +73,7 @@ if run:
         st.warning("No data returned. Try a public profile first (e.g., https://www.instagram.com/instagram/).")
         st.stop()
 
+    # Build dataframe and clean
     df = pd.DataFrame(rows)
     df = clean_dataframe_basic(df)
 
@@ -62,14 +86,28 @@ if run:
             "⬇️ Download CSV",
             data=df_to_csv_bytes(df),
             file_name="instagram_post_urls.csv",
-            mime="text/csv"
+            mime="text/csv",
+            key="dl_csv"
         )
     with c2:
         st.download_button(
             "⬇️ Download Excel",
             data=df_to_xlsx_bytes(df),
             file_name="instagram_post_urls.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_xlsx"
         )
 
     st.success(f"Done! Collected {len(df)} URLs.")
+
+# -----------------------------
+# Footer
+# -----------------------------
+st.markdown(
+    """
+---
+**Tips**
+- If you see “No data returned”, confirm env vars are set and **Restart** the service.
+- Test with a known public profile first: `https://www.instagram.com/instagram/`.
+"""
+)
