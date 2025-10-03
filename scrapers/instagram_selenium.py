@@ -10,6 +10,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.chrome.service import Service  # NEW
 
 def _normalize_instagram_input(raw: str) -> Optional[str]:
     if not raw:
@@ -40,7 +41,12 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
     )
-    driver = webdriver.Chrome(options=chrome_options)
+
+    # Explicit paths for Render's apt-installed Chromium & Chromedriver
+    chrome_options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    service = Service(os.getenv("CHROMEDRIVER", "/usr/bin/chromedriver"))
+
+    driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
