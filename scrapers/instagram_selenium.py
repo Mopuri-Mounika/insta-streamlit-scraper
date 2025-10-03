@@ -203,10 +203,16 @@ class InstagramScraperSelenium:
 
         driver = _build_driver(headless=True)
         try:
-            # First attempt (public profiles often work without login)
+            # 🔐 Login first if credentials are available (most reliable on Render)
+            if user and pwd:
+                _login(driver, user, pwd)
+            else:
+                print("[SCRAPER] No credentials set; attempting public scrape", flush=True)
+
+            # Now collect after login
             urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
 
-            # If login required and creds available, login and retry once
+            # If somehow a login wall still appeared, retry once after login
             if urls == ["__LOGIN_REQUIRED__"] and user and pwd:
                 _login(driver, user, pwd)
                 urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
