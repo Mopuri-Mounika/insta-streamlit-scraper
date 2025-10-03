@@ -1,3 +1,4 @@
+# scrapers/instagram_selenium.py
 from typing import List, Dict, Optional
 import os
 import re
@@ -11,11 +12,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
 # ----------------------------
-# Helpers
+# Utilities
 # ----------------------------
 
 def _normalize_instagram_input(raw: str) -> Optional[str]:
@@ -37,26 +38,42 @@ def _normalize_instagram_input(raw: str) -> Optional[str]:
 
 
 def _build_driver(headless: bool = True) -> webdriver.Chrome:
-    """Build a Chrome driver that works on Render (Chromium from apt)."""
+    """Build a Chrome driver that works reliably on small containers (Render free tier)."""
     chrome_options = Options()
     if headless:
         chrome_options.add_argument("--headless=new")
+
+    # Stability flags for low-RAM headless envs
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--dns-prefetch-disable")
+    chrome_options.add_argument("--hide-scrollbars")
+    chrome_options.add_argument("--window-size=1280,1696")
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+
+    # Load quicker / avoid long hangs
+    chrome_options.set_capability("pageLoadStrategy", "eager")
+
+    # Anti-automation bits
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option("useAutomationExtension", False)
     chrome_options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+        "AppleWebKit(537.36) (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
     )
 
-    # IMPORTANT: explicit paths for Render’s apt-installed Chromium & Chromedriver
+    # Explicit paths for Render’s apt packages
     chrome_options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
     service = Service(os.getenv("CHROMEDRIVER", "/usr/bin/chromedriver"))
 
     driver = webdriver.Chrome(service=service, options=chrome_options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    try:
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    except Exception:
+        pass
     return driver
 
 
@@ -83,30 +100,46 @@ def _dismiss_cookie_banner(driver: webdriver.Chrome):
 
 
 def _login(driver: webdriver.Chrome, username: str, password: str) -> None:
-    """Log in to Instagram (for private profiles or when a login wall appears)."""
+    """Log in to Instagram (for public reliability and private profiles)."""
     print("[SCRAPER] Logging in…", flush=True)
-    driver.get("https://www.instagram.com/accounts/login/")
-    time.sleep(random.uniform(3.5, 5.5))
+    try:
+        driver.get("https://www.instagram.com/accounts/login/")
+    except WebDriverException as e:
+        print(f"[SCRAPER] driver.get(login) crashed: {e}", flush=True)
+        time.sleep(2)
+        driver.get("https://www.instagram.com/accounts/login/")
 
-    wait = WebDriverWait(driver, 20)
-    u = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-    p = wait.until(EC.presence_of_element_located((By.NAME, "password")))
-    u.send_keys(username)
-    p.send_keys(password)
-    submit = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
-    submit.click()
-    time.sleep(random.uniform(5, 7))
+    time.sleep(random.uniform(3.5, 5.5))
+    wait = WebDriverWait(driver, 30)
+
+    try:
+        u = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+        p = wait.until(EC.presence_of_element_located((By.NAME, "password")))
+        u.clear(); p.clear()
+        u.send_keys(username)
+        p.send_keys(password)
+        submit = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+        submit.click()
+    except TimeoutException:
+        print("[SCRAPER] Login form not found in time", flush=True)
+        return
+
+    # Give it time to authenticate and land
+    time.sleep(random.uniform(6, 9))
 
     # Dismiss potential popups
     for _ in range(3):
         try:
             btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"Not Now") or contains(text(),"Not now")]'))
+                EC.element_to_be_clickable(
+                    (By.XPATH, '//button[contains(text(),"Not Now") or contains(text(),"Not now")]')
+                )
             )
             btn.click()
-            time.sleep(1.5)
+            time.sleep(1.2)
         except TimeoutException:
             break
+
     print("[SCRAPER] Login step complete", flush=True)
 
 
@@ -114,39 +147,42 @@ def _collect_post_urls(driver: webdriver.Chrome, handle: str, max_idle_scrolls: 
     """Scroll the profile grid, collecting /p/ (posts) and /reel/ (reels)."""
     profile_url = f"https://www.instagram.com/{handle}/"
     print(f"[SCRAPER] Visiting: {profile_url}", flush=True)
-    driver.get(profile_url)
-    time.sleep(random.uniform(3, 5))
 
+    try:
+        driver.get(profile_url)
+    except WebDriverException as e:
+        print(f"[SCRAPER] driver.get(profile) crashed: {e}", flush=True)
+        time.sleep(2)
+        driver.get(profile_url)
+
+    time.sleep(random.uniform(3, 5))
     _dismiss_cookie_banner(driver)
 
     # If a login wall appears, signal to caller
     try:
-        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.NAME, "username")))
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.NAME, "username")))
         print("[SCRAPER] Login wall detected on profile page", flush=True)
         return ["__LOGIN_REQUIRED__"]
     except Exception:
         pass
 
-    # Private / no-posts quick checks
+    # Private / no-posts checks
     if driver.find_elements(By.XPATH, '//*[contains(text(),"This account is private")]'):
-        print("[SCRAPER] Private account", flush=True)
-        return []
+        print("[SCRAPER] Private account", flush=True); return []
     if driver.find_elements(By.XPATH, '//*[contains(text(),"No posts yet")]'):
-        print("[SCRAPER] No posts yet", flush=True)
-        return []
+        print("[SCRAPER] No posts yet", flush=True); return []
 
-    # Wait for some anchors to appear
+    # Wait for anchors to appear
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/p/"], a[href*="/reel/"]'))
         )
-    except Exception:
+    except TimeoutException:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        time.sleep(3)
 
     post_urls = set()
-    prev_count = 0
-    idle = 0
+    prev_count, idle = 0, 0
 
     def capture() -> int:
         anchors = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/p/"], a[href*="/reel/"]')
@@ -159,20 +195,14 @@ def _collect_post_urls(driver: webdriver.Chrome, handle: str, max_idle_scrolls: 
     n0 = capture()
     print(f"[SCRAPER] Initial anchors found: {n0}", flush=True)
 
-    # Scroll loop
     while True:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(random.uniform(1.8, 3.5))
-        _ = capture()
+        time.sleep(random.uniform(2.0, 3.6))
+        capture()
         curr = len(post_urls)
         print(f"[SCRAPER] Collected so far: {curr}", flush=True)
-
-        if curr == prev_count:
-            idle += 1
-        else:
-            idle = 0
+        idle = idle + 1 if curr == prev_count else 0
         prev_count = curr
-
         if idle >= max_idle_scrolls:
             break
 
@@ -188,7 +218,7 @@ def _url_to_row(url: str) -> Dict:
 
 
 # ----------------------------
-# Public class
+# Public entry
 # ----------------------------
 
 class InstagramScraperSelenium:
@@ -209,10 +239,9 @@ class InstagramScraperSelenium:
             else:
                 print("[SCRAPER] No credentials set; attempting public scrape", flush=True)
 
-            # Now collect after login
             urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
 
-            # If somehow a login wall still appeared, retry once after login
+            # If a login wall somehow appeared, retry once after login
             if urls == ["__LOGIN_REQUIRED__"] and user and pwd:
                 _login(driver, user, pwd)
                 urls = _collect_post_urls(driver, handle, max_idle_scrolls=10)
